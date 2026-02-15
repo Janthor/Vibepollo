@@ -3,19 +3,12 @@
  * @brief Definitions for video.
  */
 // standard includes
-#include <algorithm>
 #include <atomic>
 #include <bitset>
-#include <chrono>
-#include <cstring>
 #include <list>
-#include <mutex>
-#include <optional>
-#include <sstream>
 #include <thread>
 
 // lib includes
-#include <boost/algorithm/string/predicate.hpp>
 #include <boost/pointer_cast.hpp>
 
 extern "C" {
@@ -34,415 +27,47 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
-#include "process.h"
 #include "sync.h"
 #include "video.h"
-#include "webrtc_stream.h"
 
 #ifdef _WIN32
-  #include <dxgi1_2.h>
-  #include <wrl/client.h>
-  #include "src/platform/windows/display_helper_integration.h"
-  #include "src/platform/windows/misc.h"
-  #include "src/platform/windows/virtual_display.h"
-  #include "uuid.h"
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
 }
-
-namespace proc {
-  extern VDISPLAY::DRIVER_STATUS vDisplayDriverStatus;
-  void initVDisplayDriver();
-}  // namespace proc
 #endif
 
 using namespace std::literals;
 
 namespace video {
 
-  bool allow_encoder_probing() {
-    // Always allow probing; previous in-process display checks removed.
-    return true;
-  }
-
   namespace {
-#ifdef _WIN32
-    bool should_prefer_virtual_display() {
-      if (platf::is_lock_screen_active() && VDISPLAY::has_active_physical_display()) {
-        return false;
-      }
-
-      if (!VDISPLAY::isSudaVDADriverInstalled()) {
-        return false;
-      }
-
-      auto virtual_displays = VDISPLAY::enumerateSudaVDADisplays();
-      if (virtual_displays.empty()) {
-        return false;
-      }
-
-      const bool explicit_virtual = (config::video.virtual_display_mode == config::video_t::virtual_display_mode_e::per_client || config::video.virtual_display_mode == config::video_t::virtual_display_mode_e::shared);
-      const bool auto_activate = config::video.dd.activate_virtual_display;
-      if (explicit_virtual || auto_activate) {
-        return true;
-      }
-
-      const bool any_active = std::any_of(
-        virtual_displays.begin(),
-        virtual_displays.end(),
-        [](const VDISPLAY::SudaVDADisplayInfo &info) {
-          return info.is_active;
-        }
-      );
-
-      if (!any_active) {
-        return false;
-      }
-
-      if (!VDISPLAY::has_active_physical_display()) {
-        return true;
-      }
-
-      return false;
-    }
-
-    std::optional<std::string> active_virtual_display_dxgi_name() {
-      auto virtual_displays = VDISPLAY::enumerateSudaVDADisplays();
-      auto map_to_dxgi_name = [](const std::wstring &name) -> std::optional<std::string> {
-        if (name.empty()) {
-          return std::nullopt;
-        }
-
-        const auto mapped = display_device::map_output_name(platf::to_utf8(name));
-        if (mapped.empty()) {
-          return std::nullopt;
-        }
-        return mapped;
-      };
-
-      for (const auto &info : virtual_displays) {
-        if (info.is_active) {
-          if (auto mapped = map_to_dxgi_name(info.device_name)) {
-            return mapped;
-          }
-        }
-      }
-
-      for (const auto &info : virtual_displays) {
-        if (auto mapped = map_to_dxgi_name(info.device_name)) {
-          return mapped;
-        }
-      }
-
-      return std::nullopt;
-    }
-#endif
-
-    bool ensure_virtual_display_ready(std::vector<std::string> &display_names, int &display_index) {
-#ifdef _WIN32
-      static thread_local std::chrono::steady_clock::time_point wait_start {};
-
-      if (display_names.empty()) {
-        display_index = 0;
-        wait_start = {};
-        return false;
-      }
-
-      display_index = std::clamp(display_index, 0, static_cast<int>(display_names.size()) - 1);
-
-      if (!should_prefer_virtual_display()) {
-        wait_start = {};
-        return true;
-      }
-
-      if (auto desired_name = active_virtual_display_dxgi_name()) {
-        for (int i = 0; i < static_cast<int>(display_names.size()); ++i) {
-          if (boost::iequals(display_names[i], *desired_name)) {
-            display_index = i;
-            wait_start = {};
-            return true;
-          }
-        }
-      }
-
-      const auto now = std::chrono::steady_clock::now();
-      if (wait_start == std::chrono::steady_clock::time_point {}) {
-        wait_start = now;
-      }
-
-      constexpr auto max_wait = std::chrono::seconds(3);
-      if (now - wait_start >= max_wait) {
-        wait_start = {};
-        return true;
-      }
-
-      return false;
-#else
-      if (display_names.empty()) {
-        display_index = 0;
-        return false;
-      }
-
-      display_index = std::clamp(display_index, 0, static_cast<int>(display_names.size()) - 1);
-      return true;
-#endif
-    }
-
-    struct EncoderProbeCacheState {
-      std::mutex mutex;
-      std::string cache_key;
-      bool valid = false;
-      bool hdr_supported = false;
-      bool hevc_passed = false;
-      bool hevc_hdr_supported = false;
-      bool av1_passed = false;
-      bool av1_hdr_supported = false;
-      int hevc_failure_retries = 0;
-      int av1_failure_retries = 0;
-
-      // Track failed probe attempts per cache key to allow retries before hard-locking
-      std::string failure_cache_key;
-      int failure_count = 0;
-      static constexpr int max_failure_retries = 3;
-    };
-
-    EncoderProbeCacheState &encoder_probe_cache_state() {
-      static EncoderProbeCacheState state;
-      return state;
-    }
-
-#ifdef _WIN32
-    // Build a stable cache sub-key for the adapter that backs the current output.
-    // Returns empty string if we cannot resolve the adapter, since the full GPU
-    // enumeration in build_probe_cache_key() provides stable adapter identification.
-    // We must NOT fall back to the display name as it can change when virtual
-    // displays are created/destroyed, causing unnecessary cache invalidation.
-    std::string adapter_cache_key_for_output(const std::string &output_name) {
-      const auto mapped_output = display_device::map_output_name(output_name);
-      Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-      if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) {
-        return "";
-      }
-
-      const auto mapped_output_w = platf::from_utf8(mapped_output);
-      for (UINT adapter_index = 0;; ++adapter_index) {
-        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(adapter_index, adapter.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) {
-          break;
-        }
-
-        DXGI_ADAPTER_DESC1 adapter_desc {};
-        if (FAILED(adapter->GetDesc1(&adapter_desc))) {
-          continue;
-        }
-
-        for (UINT output_index = 0;; ++output_index) {
-          Microsoft::WRL::ComPtr<IDXGIOutput> output;
-          const auto hr = adapter->EnumOutputs(output_index, output.GetAddressOf());
-          if (hr == DXGI_ERROR_NOT_FOUND) {
-            break;
-          }
-          if (FAILED(hr)) {
-            continue;
-          }
-
-          DXGI_OUTPUT_DESC output_desc {};
-          if (FAILED(output->GetDesc(&output_desc))) {
-            continue;
-          }
-
-          if (_wcsicmp(output_desc.DeviceName, mapped_output_w.c_str()) != 0) {
-            continue;
-          }
-
-          std::ostringstream key;
-          key << adapter_desc.VendorId << ':' << adapter_desc.DeviceId << ':' << platf::to_utf8(adapter_desc.Description);
-          return key.str();
-        }
-      }
-
-      // Return empty string instead of the display name - the display name is
-      // transient and can change when virtual displays are created/destroyed.
-      // The GPU enumeration in build_probe_cache_key() already provides stable
-      // adapter identification for cache invalidation purposes.
-      return "";
-    }
-#else
-    std::string adapter_cache_key_for_output(const std::string &output_name) {
-      (void) output_name;  // Unused on non-Windows platforms
-      return "";
-    }
-#endif
-
-    std::string build_probe_cache_key() {
-      const auto active_output = config::get_active_output_name();
-      auto adapter_key = adapter_cache_key_for_output(active_output);
-      if (adapter_key.empty()) {
-        // Per-session output overrides (ex: per-client virtual displays) can be transient and may not
-        // map to a DXGI output name; fall back to the configured output for stable cache behavior.
-        adapter_key = adapter_cache_key_for_output(config::video.output_name);
-      }
-
-      std::ostringstream oss;
-      oss << config::video.encoder << '|'
-          << adapter_key << '|'
-          << config::video.adapter_name;
-#ifdef _WIN32
-      oss << '|';
-      bool any_gpu = false;
-      for (const auto &gpu : platf::enumerate_gpus()) {
-        any_gpu = true;
-        oss << gpu.vendor_id << ':' << gpu.device_id << ':' << gpu.description << ':' << gpu.dedicated_video_memory << ';';
-      }
-      if (!any_gpu) {
-        oss << "nogpu";
-      }
-#else
-      oss << "|nogpu";
-#endif
-      return oss.str();
-    }
-
-    bool probe_cache_matches(const std::string &key,
-                             bool want_hdr,
-                             bool want_hevc,
-                             bool want_hevc_hdr,
-                             bool want_av1,
-                             bool want_av1_hdr) {
-      auto &state = encoder_probe_cache_state();
-      std::lock_guard<std::mutex> lock(state.mutex);
-
-      // Check if we have a valid cached success
-      if (state.valid && state.cache_key == key && (!want_hdr || state.hdr_supported)) {
-        const bool hevc_supported = state.hevc_passed && (!want_hevc_hdr || state.hevc_hdr_supported);
-        const bool av1_supported = state.av1_passed && (!want_av1_hdr || state.av1_hdr_supported);
-
-        if (want_hevc && !hevc_supported) {
-          if (state.hevc_failure_retries < EncoderProbeCacheState::max_failure_retries) {
-            return false;
-          }
-        }
-
-        if (want_av1 && !av1_supported) {
-          if (state.av1_failure_retries < EncoderProbeCacheState::max_failure_retries) {
-            return false;
-          }
-        }
-
-        if ((want_hevc && !hevc_supported) || (want_av1 && !av1_supported)) {
-          // We have exhausted retries for the missing codec(s); honor the cached result.
-          return true;
-        }
-
-        return true;
-      }
-
-      // If we have a cached failure for this key and haven't exceeded retry limit,
-      // allow re-probing (return false to trigger a new probe)
-      if (!state.valid && state.failure_cache_key == key) {
-        if (state.failure_count < EncoderProbeCacheState::max_failure_retries) {
-          // Allow retry - don't skip probing
-          return false;
-        }
-        // We've exceeded max retries, but we still need to probe if:
-        // - The previous successful cache key doesn't match (different config/hardware)
-        // - The cache is simply invalid
-        // Since state.valid is false here, we should let it probe again anyway
-      }
-
-      return false;
-    }
-
-    void update_probe_cache(const std::string &key,
-                            bool success,
-                            bool hdr_supported,
-                            bool hevc_passed,
-                            bool hevc_hdr_supported,
-                            bool av1_passed,
-                            bool av1_hdr_supported,
-                            bool hevc_expected,
-                            bool hevc_hdr_expected,
-                            bool av1_expected,
-                            bool av1_hdr_expected) {
-      auto &state = encoder_probe_cache_state();
-      std::lock_guard<std::mutex> lock(state.mutex);
-      const bool key_changed = state.cache_key != key;
-      if (success) {
-        state.cache_key = key;
-        state.valid = true;
-        state.hdr_supported = hdr_supported;
-        state.hevc_passed = hevc_passed;
-        state.hevc_hdr_supported = hevc_hdr_supported;
-        state.av1_passed = av1_passed;
-        state.av1_hdr_supported = av1_hdr_supported;
-        // Clear failure tracking on success
-        state.failure_cache_key.clear();
-        state.failure_count = 0;
-
-        // Reset per-codec retries when the key changes or the codec passes
-        if (key_changed) {
-          state.hevc_failure_retries = 0;
-          state.av1_failure_retries = 0;
-        }
-
-        if (hevc_expected) {
-          if (hevc_passed && (!hevc_hdr_expected || hevc_hdr_supported)) {
-            state.hevc_failure_retries = 0;
-          } else {
-            state.hevc_failure_retries = std::min(state.hevc_failure_retries + 1, EncoderProbeCacheState::max_failure_retries);
-          }
-        } else {
-          state.hevc_failure_retries = 0;
-        }
-
-        if (av1_expected) {
-          if (av1_passed && (!av1_hdr_expected || av1_hdr_supported)) {
-            state.av1_failure_retries = 0;
-          } else {
-            state.av1_failure_retries = std::min(state.av1_failure_retries + 1, EncoderProbeCacheState::max_failure_retries);
-          }
-        } else {
-          state.av1_failure_retries = 0;
-        }
-      } else {
-        state.valid = false;
-        state.cache_key.clear();
-        state.hdr_supported = false;
-        state.hevc_passed = false;
-        state.hevc_hdr_supported = false;
-        state.av1_passed = false;
-        state.av1_hdr_supported = false;
-        state.hevc_failure_retries = 0;
-        state.av1_failure_retries = 0;
-        // Track failures to allow retries up to max_failure_retries
-        if (state.failure_cache_key == key) {
-          state.failure_count++;
-        } else {
-          // New cache key, reset failure counter
-          state.failure_cache_key = key;
-          state.failure_count = 1;
-        }
-        if (state.failure_count < EncoderProbeCacheState::max_failure_retries) {
-          BOOST_LOG(warning) << "Encoder probe failed (attempt " << state.failure_count
-                             << "/" << EncoderProbeCacheState::max_failure_retries
-                             << "), will retry on next attempt";
-        } else {
-          BOOST_LOG(warning) << "Encoder probe failed after " << EncoderProbeCacheState::max_failure_retries
-                             << " attempts, caching as permanently failed for this configuration";
-        }
-      }
-    }
-
     /**
-     * @brief Check if encoder probe failures have been exhausted for a given cache key.
-     * @param key The cache key to check.
-     * @return True if we've exhausted all retry attempts for this key.
+     * @brief Check if we can allow probing for the encoders.
+     * @return True if there should be no issues with the probing, false if we should prevent it.
      */
-    bool probe_failures_exhausted(const std::string &key) {
-      auto &state = encoder_probe_cache_state();
-      std::lock_guard<std::mutex> lock(state.mutex);
-      return state.failure_cache_key == key &&
-             state.failure_count >= EncoderProbeCacheState::max_failure_retries;
+    bool allow_encoder_probing() {
+      const auto devices {display_device::enumerate_devices()};
+
+      // If there are no devices, then either the API is not working correctly or OS does not support the lib.
+      // Either way we should not block the probing in this case as we can't tell what's wrong.
+      if (devices.empty()) {
+        return true;
+      }
+
+      // Since Windows 11 24H2, it is possible that there will be no active devices present
+      // for some reason (probably a bug). Trying to probe encoders in such a state locks/breaks the DXGI
+      // and also the display device for Windows. So we must have at least 1 active device.
+      const bool at_least_one_device_is_active = std::any_of(std::begin(devices), std::end(devices), [](const auto &device) {
+        // If device has additional info, it is active.
+        return static_cast<bool>(device.m_info);
+      });
+
+      if (at_least_one_device_is_active) {
+        return true;
+      }
+
+      BOOST_LOG(error) << "No display devices are active at the moment! Cannot probe the encoders.";
+      return false;
     }
   }  // namespace
 
@@ -1421,37 +1046,18 @@ namespace video {
   int active_av1_mode;
   bool last_encoder_probe_supported_ref_frames_invalidation = false;
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};
-  std::atomic<bool> encoder_probe_attempted {false};
-  std::mutex encoder_probe_mutex;
-
-  bool has_attempted_encoder_probe() {
-    return encoder_probe_attempted.load(std::memory_order_acquire);
-  }
 
   void reset_display(std::shared_ptr<platf::display_t> &disp, const platf::mem_type_e &type, const std::string &display_name, const config_t &config) {
-    // After a recent display-helper APPLY (topology change), the display subsystem
-    // may need time to settle. Use more retries with progressive delays.
-    int max_attempts = 2;
-    std::chrono::milliseconds base_delay = 200ms;
-#ifdef _WIN32
-    const auto ms_since_apply = display_helper_integration::ms_since_last_apply();
-    if (ms_since_apply < 5000) {
-      max_attempts = 5;
-      base_delay = 300ms;
-    }
-#endif
-
-    for (int x = 0; x < max_attempts; ++x) {
+    // We try this twice, in case we still get an error on reinitialization
+    for (int x = 0; x < 2; ++x) {
       disp.reset();
       disp = platf::display(type, display_name, config);
       if (disp) {
         break;
       }
 
-      // The capture code depends on us to sleep between failures.
-      // Use progressive delays for topology changes to give the display time to settle.
-      auto delay = base_delay + std::chrono::milliseconds(x * 100);
-      std::this_thread::sleep_for(delay);
+      // The capture code depends on us to sleep between failures
+      std::this_thread::sleep_for(200ms);
     }
   }
 
@@ -1462,16 +1068,13 @@ namespace video {
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, std::string &preferred_display_name) {
+  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
-    const auto output_name = display_device::map_output_name(config::get_active_output_name());
+    const auto output_name {display_device::map_output_name(config::video.output_name)};
     std::string current_display_name;
-    auto names_match = [](const std::string &lhs, const std::string &rhs) {
-      return boost::iequals(lhs, rhs);
-    };
 
     // If we have a current display index, let's start with that
-    if (current_display_name.empty() && current_display_index >= 0 && current_display_index < display_names.size()) {
+    if (current_display_index >= 0 && current_display_index < display_names.size()) {
       current_display_name = display_names.at(current_display_index);
     }
 
@@ -1481,28 +1084,9 @@ namespace video {
 
     // If we now have no displays, let's put the old display array back and fail
     if (display_names.empty() && !old_display_names.empty()) {
-#ifdef _WIN32
-      // During a topology change (e.g. display helper just applied ensure_only_display),
-      // DXGI may temporarily report no displays. Don't fall back to stale names that
-      // include now-disabled physical displays — this causes the reinit loop to waste
-      // time trying to init on unavailable outputs. Instead, use the configured output
-      // name so the reinit loop targets the correct display.
-      const auto ms_since_apply = display_helper_integration::ms_since_last_apply();
-      if (ms_since_apply < 5000 && !output_name.empty()) {
-        BOOST_LOG(info) << "No displays found after reenumeration during topology change; "
-                        << "using configured output ["sv << output_name << "] instead of stale list"sv;
-        display_names.clear();
-        display_names.emplace_back(output_name);
-      } else {
-        BOOST_LOG(error) << "No displays were found after reenumeration!"sv;
-        display_names = std::move(old_display_names);
-        return;
-      }
-#else
       BOOST_LOG(error) << "No displays were found after reenumeration!"sv;
       display_names = std::move(old_display_names);
       return;
-#endif
     } else if (display_names.empty()) {
       display_names.emplace_back(output_name);
     }
@@ -1510,14 +1094,10 @@ namespace video {
     // We now have a new display name list, so reset the index back to 0
     current_display_index = 0;
 
-    if (current_display_name.empty()) {
-      current_display_name = display_device::map_output_name(config::video.output_name);
-    }
-
     // If we had a name previously, let's try to find it in the new list
     if (!current_display_name.empty()) {
       for (int x = 0; x < display_names.size(); ++x) {
-        if (names_match(display_names[x], current_display_name)) {
+        if (display_names[x] == current_display_name) {
           current_display_index = x;
           return;
         }
@@ -1525,30 +1105,14 @@ namespace video {
 
       // The old display was removed, so we'll start back at the first display again
       BOOST_LOG(warning) << "Previous active display ["sv << current_display_name << "] is no longer present"sv;
-
-      // If the previous display disappeared, prefer moving back to configured output before
-      // defaulting to index 0 (often primary physical display during transient display churn).
-      if (!output_name.empty()) {
-        for (int x = 0; x < display_names.size(); ++x) {
-          if (names_match(display_names[x], output_name)) {
-            current_display_index = x;
-            return;
-          }
-        }
-      }
     } else {
       for (int x = 0; x < display_names.size(); ++x) {
-        if (names_match(display_names[x], output_name)) {
+        if (display_names[x] == output_name) {
           current_display_index = x;
           return;
         }
       }
     }
-  }
-
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
-    static std::string empty_str = "";
-    refresh_displays(dev_type, display_names, current_display_index, empty_str);
   }
 
   void captureThread(
@@ -1580,30 +1144,15 @@ namespace video {
     }
     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
 
+    // Get all the monitor names now, rather than at boot, to
+    // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    std::shared_ptr<platf::display_t> disp;
-
-    while (capture_ctx_queue->running()) {
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-
-      if (!ensure_virtual_display_ready(display_names, display_p)) {
-        std::this_thread::sleep_for(50ms);
-        continue;
-      }
-
-      disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
-      if (disp) {
-        break;
-      }
-
-      std::this_thread::sleep_for(50ms);
-    }
-
+    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
     if (!disp) {
       return;
     }
-
     display_wp = disp;
 
     constexpr auto capture_buffer_size = 12;
@@ -1787,42 +1336,17 @@ namespace video {
               // only support a single display session per device/application.
               disp.reset();
 
-#ifdef _WIN32
-              // After a recent display-helper APPLY (topology change), give the display
-              // subsystem time to settle before trying to reinit. Without this, DXGI
-              // may not yet reflect the new topology, causing repeated failures that
-              // leave the stream frozen.
-              {
-                const auto ms_since_apply = display_helper_integration::ms_since_last_apply();
-                if (ms_since_apply < 1500) {
-                  auto settle_ms = std::max<int64_t>(0, 1500 - ms_since_apply);
-                  BOOST_LOG(info) << "Display topology recently changed; waiting " << settle_ms << "ms for display subsystem to settle";
-                  std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
-                }
-              }
-#endif
-
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, proc::proc.display_name);
+              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
-              if (!ensure_virtual_display_ready(display_names, display_p)) {
-                std::this_thread::sleep_for(50ms);
-                continue;
-              }
-
-              // Process any pending display switch with the new list of displays.
-              // Negative values mean "reinit only; keep display selection logic intact".
+              // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
-                const int requested = *switch_display_event->pop();
-                if (requested >= 0) {
-                  display_p = std::clamp(requested, 0, (int) display_names.size() - 1);
-                }
+                display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
               }
 
               // reset_display() will sleep between retries
               reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
               if (disp) {
-                proc::proc.display_name = display_names[display_p];
                 break;
               }
             }
@@ -1915,9 +1439,6 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
-      if (webrtc_stream::has_active_sessions()) {
-        webrtc_stream::submit_video_packet(*packet);
-      }
       packets->raise(std::move(packet));
     }
 
@@ -1939,9 +1460,6 @@ namespace video {
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
-    if (webrtc_stream::has_active_sessions()) {
-      webrtc_stream::submit_video_packet(*packet);
-    }
     packets->raise(std::move(packet));
 
     return 0;
@@ -2014,6 +1532,11 @@ namespace video {
       ctx->height = config.height;
       ctx->time_base = AVRational {1, config.framerate};
       ctx->framerate = AVRational {config.framerate, 1};
+      if (config.framerateX100 > 0) {
+        AVRational fps = video::framerateX100_to_rational(config.framerateX100);
+        ctx->framerate = fps;
+        ctx->time_base = AVRational {fps.den, fps.num};
+      }
 
       switch (config.videoFormat) {
         case 0:
@@ -2195,7 +1718,8 @@ namespace video {
         }
       }
 
-      auto bitrate = config.bitrate * 1000;
+      auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
+      BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
       ctx->rc_max_rate = bitrate;
       ctx->bit_rate = bitrate;
 
@@ -2382,20 +1906,10 @@ namespace video {
       }
     });
 
-    if (config.encodingFramerate <= 0) {
-      const int fallback_fps = config.framerate > 0 ? config.framerate * 1000 : 60000;
-      BOOST_LOG(warning) << "Encoding framerate missing; falling back to " << fallback_fps;
-      config.encodingFramerate = fallback_fps;
-    }
-
     // set max frame time based on client-requested target framerate.
-    double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target * 1000 : std::max(config.encodingFramerate / 5, 10000);
-    auto max_frametime = std::chrono::nanoseconds(1000ms) * 1000 / minimum_fps_target;
-    auto encode_frame_threshold = std::chrono::nanoseconds(1000ms) * 1000 / config.encodingFramerate;
-    auto frame_variation_threshold = encode_frame_threshold / 4;
-    auto min_frame_diff = encode_frame_threshold - frame_variation_threshold;
-    BOOST_LOG(info) << "Minimum FPS target set to ~"sv << (minimum_fps_target / 2000) << "fps ("sv << max_frametime * 2 << ")"sv;
-    BOOST_LOG(info) << "Encoding Frame threshold: "sv << encode_frame_threshold;
+    double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : config.framerate;
+    std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
+    BOOST_LOG(info) << "Minimum FPS target set to ~"sv << (minimum_fps_target / 2) << "fps ("sv << max_frametime.count() * 2 << "ms)"sv;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
@@ -2412,26 +1926,6 @@ namespace video {
         return;
       }
     }
-
-    if (config.input_only) {
-      BOOST_LOG(info) << "Input only session, video will not be captured."sv;
-
-      // Encode the dummy img only once
-      if (encode(frame_nr++, *session, packets, channel_data, std::chrono::steady_clock::now())) {
-        BOOST_LOG(error) << "Could not encode dummy video packet"sv;
-        return;
-      }
-
-      while (true) {
-        if (shutdown_event->peek() || !images->running() || (reinit_event.peek())) {
-          return;
-        } else {
-          std::this_thread::sleep_for(300ms);
-        }
-      }
-    }
-
-    std::optional<std::chrono::steady_clock::time_point> encode_frame_timestamp;
 
     while (true) {
       // Break out of the encoding loop if any of the following are true:
@@ -2470,23 +1964,8 @@ namespace video {
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
-            break;
+            return;
           }
-
-          if (!encode_frame_timestamp) {
-            encode_frame_timestamp = *frame_timestamp;
-          }
-
-          const auto time_diff = (*frame_timestamp > *encode_frame_timestamp)
-            ? (*frame_timestamp - *encode_frame_timestamp)
-            : (*encode_frame_timestamp - *frame_timestamp);
-          if (time_diff < frame_variation_threshold) {
-            *frame_timestamp = *encode_frame_timestamp;
-          } else {
-            *encode_frame_timestamp = *frame_timestamp;
-          }
-
-          *encode_frame_timestamp += encode_frame_threshold;
         } else if (!images->running()) {
           break;
         }
@@ -2494,7 +1973,7 @@ namespace video {
 
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
-        break;
+        return;
       }
 
       session->request_normal_frame();
@@ -2644,32 +2123,12 @@ namespace video {
     }
 
     while (encode_session_ctx_queue.running()) {
-#ifdef _WIN32
-      // After a recent display-helper APPLY, give the display subsystem time to settle.
-      {
-        const auto ms_since_apply = display_helper_integration::ms_since_last_apply();
-        if (ms_since_apply < 1500) {
-          auto settle_ms = std::max<int64_t>(0, 1500 - ms_since_apply);
-          BOOST_LOG(info) << "Display topology recently changed; waiting " << settle_ms << "ms for display subsystem to settle";
-          std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
-        }
-      }
-#endif
       // Refresh display names since a display removal might have caused the reinitialization
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
-      if (!ensure_virtual_display_ready(display_names, display_p)) {
-        std::this_thread::sleep_for(50ms);
-        continue;
-      }
-
-      // Process any pending display switch with the new list of displays.
-      // Negative values mean "reinit only; keep display selection logic intact".
+      // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
-        const int requested = *switch_display_event->pop();
-        if (requested >= 0) {
-          display_p = std::clamp(requested, 0, (int) display_names.size() - 1);
-        }
+        display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
       }
 
       // reset_display() will sleep between retries
@@ -2940,95 +2399,59 @@ namespace video {
   };
 
   int validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
-    const int max_attempts = config.videoFormat >= 1 ? 3 : 1;  // HEVC/AV1 can fail transiently during probing
-    const auto codec_name = [&]() -> std::string_view {
-      switch (config.videoFormat) {
-        case 0: return "H.264"sv;
-        case 1: return "HEVC"sv;
-        case 2: return "AV1"sv;
-        default: return "codec"sv;
-      }
-    }();
+    auto encode_device = make_encode_device(*disp, encoder, config);
+    if (!encode_device) {
+      return -1;
+    }
 
-    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-      auto validate_once = [&]() -> util::optional_t<int> {
-        auto encode_device = make_encode_device(*disp, encoder, config);
-        if (!encode_device) {
-          return util::false_v<util::optional_t<int>>;
-        }
+    auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
+    if (!session) {
+      return -1;
+    }
 
-        auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
-        if (!session) {
-          return util::false_v<util::optional_t<int>>;
-        }
-
-        {
-          // Image buffers are large, so we use a separate scope to free it immediately after convert()
-          auto img = disp->alloc_img();
-          if (!img || disp->dummy_img(img.get()) || session->convert(*img)) {
-            return util::false_v<util::optional_t<int>>;
-          }
-        }
-
-        session->request_idr_frame();
-
-        // Use a probe-local mail/queue to avoid stale packets from previous encoder sessions.
-        auto probe_mail = std::make_shared<safe::mail_raw_t>();
-        auto packets = probe_mail->queue<packet_t>(mail::video_packets);
-
-        while (!packets->peek()) {
-          if (encode(1, *session, packets, nullptr, {})) {
-            return util::false_v<util::optional_t<int>>;
-          }
-        }
-
-        auto packet = packets->pop();
-        if (!packet->is_idr()) {
-          BOOST_LOG(error) << "First packet type is not an IDR frame"sv;
-          return util::false_v<util::optional_t<int>>;
-        }
-
-        int flag = 0;
-
-        // This check only applies for H.264 and HEVC
-        if (config.videoFormat <= 1) {
-          if (auto packet_avcodec = dynamic_cast<packet_raw_avcodec *>(packet.get())) {
-            if (cbs::validate_sps(packet_avcodec->av_packet, config.videoFormat ? AV_CODEC_ID_H265 : AV_CODEC_ID_H264)) {
-              flag |= VUI_PARAMS;
-            }
-          } else {
-            // Don't check it for non-avcodec encoders.
-            flag |= VUI_PARAMS;
-          }
-        }
-
-        return flag;
-      };
-
-      auto result = validate_once();
-      if (result) {
-        return *result;
-      }
-
-      if (attempt < max_attempts) {
-        BOOST_LOG(debug) << "Encoder probe: failed to validate "sv << codec_name << " config (attempt "sv
-                         << attempt << "/" << max_attempts << "), retrying."sv;
-        std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    {
+      // Image buffers are large, so we use a separate scope to free it immediately after convert()
+      auto img = disp->alloc_img();
+      if (!img || disp->dummy_img(img.get()) || session->convert(*img)) {
+        return -1;
       }
     }
 
-    return -1;
+    session->request_idr_frame();
+
+    auto packets = mail::man->queue<packet_t>(mail::video_packets);
+    while (!packets->peek()) {
+      if (encode(1, *session, packets, nullptr, {})) {
+        return -1;
+      }
+    }
+
+    auto packet = packets->pop();
+    if (!packet->is_idr()) {
+      BOOST_LOG(error) << "First packet type is not an IDR frame"sv;
+
+      return -1;
+    }
+
+    int flag = 0;
+
+    // This check only applies for H.264 and HEVC
+    if (config.videoFormat <= 1) {
+      if (auto packet_avcodec = dynamic_cast<packet_raw_avcodec *>(packet.get())) {
+        if (cbs::validate_sps(packet_avcodec->av_packet, config.videoFormat ? AV_CODEC_ID_H265 : AV_CODEC_ID_H264)) {
+          flag |= VUI_PARAMS;
+        }
+      } else {
+        // Don't check it for non-avcodec encoders.
+        flag |= VUI_PARAMS;
+      }
+    }
+
+    return flag;
   }
 
-  static thread_local std::shared_ptr<platf::display_t> cached_probe_display;
-  static thread_local platf::mem_type_e cached_display_type = platf::mem_type_e::system;
-
   bool validate_encoder(encoder_t &encoder, bool expect_failure) {
-    // During encoder probing, always use the current active display and do not
-    // attempt to select/swap displays based on configured output_name. Display
-    // swaps are now handled externally when a stream starts.
-    const std::string probe_display_name;  // empty selects the current active display
-
+    const auto output_name {display_device::map_output_name(config::video.output_name)};
     std::shared_ptr<platf::display_t> disp;
 
     BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
@@ -3044,19 +2467,11 @@ namespace video {
     encoder.av1.capabilities.set();
 
     // First, test encoder viability
-    config_t config_max_ref_frames {1920, 1080, 60, 1000, 1, 1, 1, 0, 0, 0};
-    config_t config_autoselect {1920, 1080, 60, 1000, 1, 0, 1, 0, 0, 0};
+    config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0};
+    config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0};
 
     // If the encoder isn't supported at all (not even H.264), bail early
-    // Try to reuse cached display if same device type
-    if (cached_probe_display && cached_display_type == encoder.platform_formats->dev_type) {
-      disp = cached_probe_display;
-    } else {
-      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
-      cached_probe_display = disp;
-      cached_display_type = encoder.platform_formats->dev_type;
-    }
-
+    reset_display(disp, encoder.platform_formats->dev_type, output_name, config_autoselect);
     if (!disp) {
       return false;
     }
@@ -3148,20 +2563,17 @@ namespace video {
     {
       // H.264 is special because encoders may support YUV 4:4:4 without supporting 10-bit color depth
       if (encoder.flags & YUV444_SUPPORT) {
-        config_t config_h264_yuv444 {1920, 1080, 60, 1000, 1, 0, 1, 0, 0, 1};
+        config_t config_h264_yuv444 {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 1};
         encoder.h264[encoder_t::YUV444] = disp->is_codec_supported(encoder.h264.name, config_h264_yuv444) &&
                                           validate_config(disp, encoder, config_h264_yuv444) >= 0;
       } else {
         encoder.h264[encoder_t::YUV444] = false;
       }
 
-      const config_t generic_hdr_config = {1920, 1080, 60, 1000, 1, 0, 3, 1, 1, 0};
+      const config_t generic_hdr_config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, 1, 1, 0};
 
-      // Reset the display since we're switching from SDR to HDR. Keep probing on the
-      // current active display without attempting a display swap.
-      // Clear the cache since we need a fresh display for HDR testing
-      cached_probe_display.reset();
-      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, generic_hdr_config);
+      // Reset the display since we're switching from SDR to HDR
+      reset_display(disp, encoder.platform_formats->dev_type, output_name, generic_hdr_config);
       if (!disp) {
         return false;
       }
@@ -3220,47 +2632,17 @@ namespace video {
   }
 
   int probe_encoders() {
-    std::lock_guard<std::mutex> lock(encoder_probe_mutex);
-    encoder_probe_attempted.store(true, std::memory_order_release);
-    const auto cache_key = build_probe_cache_key();
-    const bool hevc_mode_auto = config::video.hevc_mode == 0;
-    const bool av1_mode_auto = config::video.av1_mode == 0;
-    const bool wants_hdr = (config::video.hevc_mode == 3) || (config::video.av1_mode == 3);
-    const bool wants_hevc = config::video.hevc_mode >= 2 || hevc_mode_auto;
-    const bool wants_hevc_hdr = config::video.hevc_mode == 3 || hevc_mode_auto;
-    const bool wants_av1 = config::video.av1_mode >= 2 || av1_mode_auto;
-    const bool wants_av1_hdr = config::video.av1_mode == 3 || av1_mode_auto;
-
-    if (probe_cache_matches(cache_key, wants_hdr, wants_hevc, wants_hevc_hdr, wants_av1, wants_av1_hdr)) {
-      BOOST_LOG(debug) << "Encoder probe skipped (cached success).";
-      return 0;
-    }
-
-    // Check if we've exhausted all retry attempts for this configuration
-    if (probe_failures_exhausted(cache_key)) {
-      BOOST_LOG(debug) << "Encoder probe skipped (max retry attempts exhausted).";
-      return -1;
-    }
-
     if (!allow_encoder_probing()) {
       // Error already logged
-      update_probe_cache(cache_key, false, false, false, false, false, false, wants_hevc, wants_hevc_hdr, wants_av1, wants_av1_hdr);
       return -1;
     }
 
-    const auto previous_active_hevc_mode = active_hevc_mode;
-    const auto previous_active_av1_mode = active_av1_mode;
-    const auto previous_last_ref_frames_invalidation = last_encoder_probe_supported_ref_frames_invalidation;
-    const auto previous_last_yuv444_for_codec = last_encoder_probe_supported_yuv444_for_codec;
-
-    auto restore_previous_probe_state = util::fail_guard([&]() {
-      active_hevc_mode = previous_active_hevc_mode;
-      active_av1_mode = previous_active_av1_mode;
-      last_encoder_probe_supported_ref_frames_invalidation = previous_last_ref_frames_invalidation;
-      last_encoder_probe_supported_yuv444_for_codec = previous_last_yuv444_for_codec;
-    });
-
     auto encoder_list = encoders;
+
+    // If we already have a good encoder, check to see if another probe is required
+    if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
+      return 0;
+    }
 
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;
@@ -3268,10 +2650,6 @@ namespace video {
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
     last_encoder_probe_supported_ref_frames_invalidation = false;
-    last_encoder_probe_supported_yuv444_for_codec = {};
-
-    // Clear any cached display from previous probes to ensure fresh start
-    cached_probe_display.reset();
 
     auto adjust_encoder_constraints = [&](encoder_t *encoder) {
       // If we can't satisfy both the encoder and codec requirement, prefer the encoder over codec support
@@ -3378,14 +2756,13 @@ namespace video {
     }
 
     if (chosen_encoder == nullptr) {
-      const auto output_name = display_device::map_output_name(config::get_active_output_name());
+      const auto output_name {display_device::map_output_name(config::video.output_name)};
       BOOST_LOG(fatal) << "Unable to find display or encoder during startup."sv;
       if (!config::video.adapter_name.empty() || !output_name.empty()) {
         BOOST_LOG(fatal) << "Please ensure your manually chosen GPU and monitor are connected and powered on."sv;
       } else {
         BOOST_LOG(fatal) << "Please check that a display is connected and powered on."sv;
       }
-      update_probe_cache(cache_key, false, false, false, false, false, false, wants_hevc, wants_hevc_hdr, wants_av1, wants_av1_hdr);
       return -1;
     }
 
@@ -3441,23 +2818,6 @@ namespace video {
       active_av1_mode = encoder.av1[encoder_t::PASSED] ? (encoder.av1[encoder_t::DYNAMIC_RANGE] ? 3 : 2) : 1;
     }
 
-    const bool hevc_passed = encoder.hevc[encoder_t::PASSED];
-    const bool hevc_hdr_supported = encoder.hevc[encoder_t::DYNAMIC_RANGE];
-    const bool av1_passed = encoder.av1[encoder_t::PASSED];
-    const bool av1_hdr_supported = encoder.av1[encoder_t::DYNAMIC_RANGE];
-    const bool cache_hdr_supported = hevc_hdr_supported || av1_hdr_supported;
-    update_probe_cache(cache_key,
-                       true,
-                       cache_hdr_supported,
-                       hevc_passed,
-                       hevc_hdr_supported,
-                       av1_passed,
-                       av1_hdr_supported,
-                       wants_hevc,
-                       wants_hevc_hdr,
-                       wants_av1,
-                       wants_av1_hdr);
-    restore_previous_probe_state.disable();
     return 0;
   }
 
